@@ -1,7 +1,3 @@
-"""Implementation for base attacker class.
-
-Inherit from this class for a consistent interface with attack cases."""
-
 import torch
 from collections import defaultdict
 import copy
@@ -11,18 +7,13 @@ from ..cases.models.transformer_dictionary import lookup_grad_indices
 
 import logging
 import sys
-# sys.path.append('../../')
-from feature2label_res34 import get_labels
+from feature2label_resnet import get_labels
 
 log = logging.getLogger(__name__)
 embedding_layer_names = ["encoder.weight", "word_embeddings.weight", "transformer.wte"]
 
 
 class _BaseAttacker:
-    """This is a template class for an attack.
-
-    A basic assumption for this attacker is that user data is fixed over multiple queries.
-    """
 
     def __init__(self, model, loss_fn, cfg_attack, setup=dict(dtype=torch.float, device=torch.device("cpu"))):
         self.cfg = cfg_attack
@@ -32,10 +23,6 @@ class _BaseAttacker:
         self.loss_fn = copy.deepcopy(loss_fn)
 
     def reconstruct(self, server_payload, shared_data, server_secrets=None, dryrun=False):
-        """Overwrite this function to implement a new attack."""
-        # Implement the attack here
-        # The attack should consume the shared_data and server payloads and reconstruct into a dict
-        # with key data, labels
         raise NotImplementedError()
 
         return reconstructed_data, stats
@@ -44,7 +31,6 @@ class _BaseAttacker:
         raise NotImplementedError()
 
     def prepare_attack(self, server_payload, shared_data):
-        """Basic startup common to many reconstruction methods."""
         stats = defaultdict(list)
 
         shared_data = shared_data.copy()  # Shallow copy is enough
@@ -77,8 +63,6 @@ class _BaseAttacker:
         return rec_models, labels, stats
 
     def _prepare_for_text_data(self, shared_data, rec_models):
-        """Reconstruct the output of the Embedding Layer?"""
-        # _circumvent_embedding_layer
         if "run-embedding" == self.cfg.text_strategy:
             # 1) Basic trick: Optimize in embedding space
             # Cut off embeddings:
@@ -116,16 +100,9 @@ class _BaseAttacker:
             pass
         else:
             raise ValueError(f"Invalid text strategy {self.cfg.text_strategy} given.")
-        # To try later:
-        # Assuming sequence_length is known, and all tokens are leaked from the Embedding Layer
-        # We should find the input by optimizing a "segmentation map" of these tokens
-        # This can be relaxed to [0,1] constraints and solved with convex programming tricks
-        # The Relaxation can be constructed over the Subset of tokens with non-zero gradients
-        # Basic model (as also seen in DLG): Optimize in embedding space
         return rec_models, shared_data
 
     def _postprocess_text_data(self, reconstructed_user_data, models=None):
-        """Post-process text data to recover tokens."""
 
         def _max_similarity(recovered_embeddings, true_embeddings):
             recovered_embeddings = recovered_embeddings - recovered_embeddings.mean(dim=-1, keepdim=True)
@@ -170,9 +147,6 @@ class _BaseAttacker:
         return reconstructed_user_data
 
     def _construct_models_from_payload_and_buffers(self, server_payload, shared_data):
-        """Construct the model (or multiple) that is sent by the server and include user buffers if any."""
-
-        # Load states into multiple models if necessary
         models = []
         for idx, payload in enumerate(server_payload):
 
@@ -215,7 +189,6 @@ class _BaseAttacker:
         return models
 
     def _cast_shared_data(self, shared_data):
-        """Cast user data to reconstruction data type."""
         for data in shared_data:
             data["gradients"] = [g.to(dtype=self.setup["dtype"]) for g in data["gradients"]]
             if data["buffers"] is not None:
@@ -223,7 +196,6 @@ class _BaseAttacker:
         return shared_data
 
     def _initialize_data(self, data_shape):
-        """Note that data is initialized "inside" the network normalization."""
         init_type = self.cfg.init
         if init_type == "randn":
             candidate = torch.randn(data_shape, **self.setup)
@@ -233,8 +205,6 @@ class _BaseAttacker:
             candidate = (torch.rand(data_shape, **self.setup) * 2) - 1.0
         elif init_type == "zeros":
             candidate = torch.zeros(data_shape, **self.setup)
-        # Initializations from Wei et al, "A Framework for Evaluating Gradient Leakage
-        #                                  Attacks in Federated Learning"
         elif any(c in init_type for c in ["red", "green", "blue", "dark", "light"]):  # init_types like 'red-true'
             candidate = torch.zeros(data_shape, **self.setup)
             if "light" in init_type:
@@ -299,21 +269,12 @@ class _BaseAttacker:
         return optimizer, scheduler
 
     def _normalize_gradients(self, shared_data, fudge_factor=1e-6):
-        """Normalize gradients to have norm of 1. No guarantees that this would be a good idea for FL updates."""
         for data in shared_data:
             grad_norm = torch.stack([g.pow(2).sum() for g in data["gradients"]]).sum().sqrt()
             torch._foreach_div_(data["gradients"], max(grad_norm, fudge_factor))
         return shared_data
 
     def _recover_label_information(self, user_data, server_payload, rec_models):
-        """Recover label information.
-
-        This method runs under the assumption that the last two entries in the gradient vector
-        correpond to the weight and bias of the last layer (mapping to num_classes).
-        For non-classification tasks this has to be modified.
-
-        The behavior with respect to multiple queries is work in progress and subject of debate.
-        """
         num_data_points = user_data[0]["metadata"]["num_data_points"]
         num_classes = user_data[0]["gradients"][-1].shape[0]
         num_queries = len(user_data)
@@ -321,39 +282,29 @@ class _BaseAttacker:
         if self.cfg.label_strategy is None:
             return None
         elif self.cfg.label_strategy == "iDLG":
-            # In the simplest case, the label can just be inferred from the last layer
-            # This was popularized in "iDLG" by Zhao et al., 2020
-            # assert num_data_points == 1
             label_list = []
             for query_id, shared_data in enumerate(user_data):
                 last_weight_min = torch.argmin(torch.sum(shared_data["gradients"][-2], dim=-1), dim=-1)
                 label_list += [last_weight_min.detach()]
             labels = torch.stack(label_list).unique()
         elif self.cfg.label_strategy == "analytic":
-            # Analytic recovery simply works as long as all labels are unique.
             label_list = []
             for query_id, shared_data in enumerate(user_data):
                 valid_classes = (shared_data["gradients"][-1] < 0).nonzero()
                 label_list += [valid_classes]
             labels = torch.stack(label_list).unique()[:num_data_points]
         elif self.cfg.label_strategy == "yin":
-            # As seen in Yin et al. 2021, "See Through Gradients: Image Batch Recovery via GradInversion"
-            # This additionally assumes that there is a nonlinearity with positive output (like ReLU) in front of the
-            # last classification layer.
-            # This scheme also works best if all labels are unique
-            # Otherwise this is an extension of iDLG to multiple labels:
             total_min_vals = 0
             for query_id, shared_data in enumerate(user_data):
                 total_min_vals += shared_data["gradients"][-2].min(dim=-1)[0]
             labels = total_min_vals.argsort()[:num_data_points]
             print(labels.shape)
-        elif self.cfg.label_strategy == "ye_res34":
+        elif "ye_res" in self.cfg.label_strategy:
             n_pop, iters = 20, 200
-            labels = get_labels(user_data[0], num_data_points, n_pop, iters)
+            labels = get_labels(user_data[0], num_data_points, n_pop, iters, self.cfg.label_strategy)
         elif "wainakh" in self.cfg.label_strategy:
 
             if self.cfg.label_strategy == "wainakh-simple":
-                # As seen in Weinakh et al., "User Label Leakage from Gradients in Federated Learning"
                 m_impact = 0
                 for query_id, shared_data in enumerate(user_data):
                     g_i = shared_data["gradients"][-2].sum(dim=1)
@@ -363,7 +314,6 @@ class _BaseAttacker:
                     s_offset = 0
                     m_impact += m_query / num_queries
             elif self.cfg.label_strategy == "wainakh-whitebox":
-                # Augment previous strategy with measurements of label impact for dummy data.
                 m_impact = 0
                 s_offset = torch.zeros(num_classes, **self.setup)
 
@@ -394,7 +344,6 @@ class _BaseAttacker:
             else:
                 raise ValueError(f"Invalid Wainakh strategy {self.cfg.label_strategy}.")
 
-            # After determining impact and offset, run the actual recovery algorithm
             label_list = []
             g_per_query = [shared_data["gradients"][-2].sum(dim=1) for shared_data in user_data]
             g_i = torch.stack(g_per_query).mean(dim=0)
@@ -413,7 +362,6 @@ class _BaseAttacker:
             labels = torch.stack(label_list)
 
         elif self.cfg.label_strategy == "bias-corrected":  # WIP
-            # This is slightly modified analytic label recovery in the style of Wainakh
             bias_per_query = [shared_data["gradients"][-1] for shared_data in user_data]
             label_list = []
             # Stage 1
@@ -454,38 +402,27 @@ class _BaseAttacker:
             labels = torch.stack(label_list).view(num_data_points, self.data_shape[0])
 
         elif self.cfg.label_strategy == "random":
-            # A random baseline
             labels = torch.randint(0, num_classes, (num_data_points,), device=self.setup["device"])
         elif self.cfg.label_strategy == "exhaustive":
-            # Exhaustive search is possible in principle
             combinations = num_classes**num_data_points
             raise ValueError(
                 f"Exhaustive label searching not implemented. Nothing stops you though from running your"
                 f"attack algorithm for any possible combination of labels, except computational effort."
                 f"In the given setting, a naive exhaustive strategy would attack {combinations} label vectors."
             )
-            # Although this is arguably a worst-case estimate, you might be able to get "close enough" to the actual
-            # label vector in much fewer queries, depending on which notion of close-enough makes sense for a given attack.
         else:
             raise ValueError(f"Invalid label recovery strategy {self.cfg.label_strategy} given.")
 
-        # Pad with random labels if too few were produced:
         if len(labels) < num_data_points:
             labels = torch.cat(
                 [labels, torch.randint(0, num_classes, (num_data_points - len(labels),), device=self.setup["device"])]
             )
 
-        # Always sort, order does not matter here:
         labels = labels.sort()[0]
         log.info(f"Recovered labels {labels.tolist()} through strategy {self.cfg.label_strategy}.")
         return labels
 
     def recover_token_information(self, user_data, server_payload, model_name):
-        """Recover token information. This is a variation of previous attacks on label recovery, but can abuse
-        the embeddings layer in addition to the decoder layer.
-
-        The behavior with respect to multiple queries is work in progress and subject of debate.
-        """
         if self.cfg.token_strategy is None:
             return None
         embedding_parameter_idx, decoder_bias_parameter_idx = lookup_grad_indices(model_name)
@@ -506,9 +443,6 @@ class _BaseAttacker:
         if self.cfg.token_strategy == "decoder-bias":
             if decoder_bias_parameter_idx is None:
                 raise ValueError("Cannot use this strategy on a model without decoder bias.")
-            # works super well for normal stuff like transformer3 without tying
-
-            # This is slightly modified analytic label recovery in the style of Wainakh
 
             token_list = []
             # Stage 1
@@ -541,7 +475,6 @@ class _BaseAttacker:
             tokens = torch.stack(token_list).view(num_data_points, self.data_shape[0])
 
         elif self.cfg.token_strategy == "embedding-norm":
-            # This works decently well for GPT which has no decoder bias
             token_list = []
             # Stage 1
             average_wte_norm = torch.stack(wte_per_query).mean(dim=0).norm(dim=1)
@@ -562,10 +495,6 @@ class _BaseAttacker:
                 valid_classes = average_wte_norm.topk(k=num_missing_tokens).indices
             token_list += [*valid_classes]
 
-            # top2-log rule is decent:
-            # top2 = average_wte_norm.log().topk(k=2).values  # log here is not an accident!
-            # m_impact = top2[0] - top2[1]
-            # but the sum is simpler:
             m_impact = average_wte_norm[valid_classes].sum() / num_missing_tokens
 
             average_wte_norm[valid_classes] = average_wte_norm[valid_classes] - m_impact
@@ -606,8 +535,6 @@ class _BaseAttacker:
             tokens = torch.stack(token_list)
 
         elif self.cfg.token_strategy == "mixed":
-            # Can improve performance for tied embeddings over just decoder-bias
-            # as unique token extraction is slightly more exact from the embedding layer
 
             token_list = []
             # Stage 1
@@ -636,7 +563,6 @@ class _BaseAttacker:
             tokens = torch.stack(token_list)
 
         elif self.cfg.token_strategy == "greedy-embedding":
-            # Sanity check without unique token selection
             token_list = []
             # Stage 1
             average_wte_norm = torch.stack(wte_per_query).mean(dim=0).norm(dim=1)
@@ -648,7 +574,6 @@ class _BaseAttacker:
                 average_bias[selected_idx] -= m_impact
             tokens = torch.stack(token_list)
         elif self.cfg.token_strategy == "greedy-bias":
-            # Sanity check without unique token selection
             token_list = []
             # Stage 1
             average_bias = torch.stack(bias_per_query).mean(dim=0)
@@ -662,7 +587,6 @@ class _BaseAttacker:
         else:
             raise ValueError(f"Invalid strategy {self.cfg.token_strategy} for token recovery before attack.")
 
-        # Always sort, order does not matter here:
         tokens = tokens.sort()[0]
         log.info(f"Recovered tokens {tokens} through strategy {self.cfg.token_strategy}.")
         return tokens
